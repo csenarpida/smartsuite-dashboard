@@ -12,7 +12,7 @@ st.set_page_config(page_title="Ops Dashboard", page_icon="📊", layout="wide")
 API_KEY       = "df07a54caefda1693bfdad758056124fc5cc88f0"
 ACCOUNT_ID    = "svxkeb0y"
 SOLUTION_ID   = "67b284afc71e608ca6f6902c"
-TABLE_ID      = "69a54ceded771376615c0560"
+TABLE_ID      = "685953c5a74d7ddd3b1e6673"
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
