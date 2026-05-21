@@ -9,7 +9,7 @@ from datetime import datetime
 st.set_page_config(page_title="Ops Dashboard", page_icon="📊", layout="wide")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_KEY    = st.secrets.get("df07a54caefda1693bfdad758056124fc5cc88f0", "")
+API_KEY    = st.secrets.get("API_KEY", "")
 ACCOUNT_ID = "svxkeb0y"
 TABLE_ID   = "685953c5a74d7ddd3b1e6673"
 
