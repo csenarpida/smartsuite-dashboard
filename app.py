@@ -148,7 +148,7 @@ st.caption(f"Live data from SmartSuite · {datetime.now().strftime('%b %d, %Y at
 st.divider()
 
 # ── Load ──────────────────────────────────────────────────────────────────────
-df = load_data(max_records=5000)
+df = load_data(max_records=500)
 
 if df.empty:
     st.warning("No data loaded.")
