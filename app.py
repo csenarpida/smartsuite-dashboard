@@ -29,8 +29,6 @@ POD_COL    = "Pod"
 STATUS_COL = "In Advanced / Delayed / On time"
 TYPE_COL   = "Type"
 
-KEEP_COLS = [POD_COL, STATUS_COL, TYPE_COL, "First Created"] + list(PHASE_COLS.values())
-
 def extract_date(val):
     if not val:
         return None
@@ -39,79 +37,75 @@ def extract_date(val):
 
 def fetch_page(offset, limit, headers):
     url = f"https://app.smartsuite.com/api/v1/applications/{TABLE_ID}/records/list/"
-    resp = requests.post(url, headers=headers, json={"limit": limit, "offset": offset}, timeout=30)
-    if resp.status_code != 200:
+    try:
+        resp = requests.post(
+            url,
+            headers=headers,
+            json={"limit": limit, "offset": offset},
+            timeout=30
+        )
+        if resp.status_code != 200:
+            st.warning(f"API error {resp.status_code} at offset {offset}: {resp.text[:200]}")
+            return None, 0
+        data = resp.json()
+        return data.get("items", []), data.get("total", 0)
+    except Exception as e:
+        st.warning(f"Request failed at offset {offset}: {e}")
         return None, 0
-    data = resp.json()
-    return data.get("items", []), data.get("total", 0)
-
-def slim_record(fields):
-    row = {}
-    for k in KEEP_COLS:
-        v = fields.get(k)
-        if v is not None:
-            row[k] = v
-    return row
 
 @st.cache_data(ttl=3600, max_entries=1)
-def load_data(max_records=5000):
-    """Load up to max_records, taking a representative sample if needed."""
+def load_all_data():
+    """Fetch ALL records with ALL fields from SmartSuite."""
     headers = {
         "Authorization": f"Token {API_KEY}",
         "Account-Id": ACCOUNT_ID,
         "Content-Type": "application/json",
     }
 
-    # First call to get total count
+    # First call: get total count
     items, total = fetch_page(0, 1, headers)
     if items is None:
-        st.error("Could not connect to SmartSuite. Check your API key.")
+        st.error("❌ Could not connect to SmartSuite. Check your API key in Streamlit secrets.")
         return pd.DataFrame()
 
-    st.info(f"Found {total:,} records. Loading up to {max_records:,} for analysis...")
+    if total == 0:
+        st.warning("⚠️ API connected but returned 0 records. Check TABLE_ID and ACCOUNT_ID.")
+        return pd.DataFrame()
+
+    st.info(f"📦 Found **{total:,}** records. Fetching all...")
 
     rows = []
-    limit = 250  # small batches
-    offsets_to_fetch = []
-
-    if total <= max_records:
-        # Fetch everything
-        offsets_to_fetch = list(range(0, total, limit))
-    else:
-        # Sample evenly across the full dataset
-        step = total / max_records * limit
-        offset = 0
-        while offset < total and len(rows) < max_records:
-            offsets_to_fetch.append(int(offset))
-            offset += step
-
+    limit = 250
+    offsets = list(range(0, total, limit))
     progress = st.progress(0, text="Loading records...")
 
-    for i, offset in enumerate(offsets_to_fetch):
-        items, _ = fetch_page(int(offset), limit, headers)
-        if items is None:
+    for i, offset in enumerate(offsets):
+        batch, _ = fetch_page(offset, limit, headers)
+        if batch is None:
             break
-        for record in items:
+        for record in batch:
+            # Grab ALL fields — no filtering
             fields = record.get("fields", record)
-            rows.append(slim_record(fields))
-        progress.progress((i + 1) / len(offsets_to_fetch), text=f"Loaded batch {i+1}/{len(offsets_to_fetch)}...")
+            rows.append(fields)
+        progress.progress((i + 1) / len(offsets), text=f"Batch {i+1}/{len(offsets)} — {len(rows):,} records loaded")
         gc.collect()
 
     progress.empty()
+    st.success(f"✅ Loaded {len(rows):,} of {total:,} records.")
 
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
 
-    # Parse date
+    # Parse date from "First Created"
     if "First Created" in df.columns:
         df["month"] = pd.to_datetime(
             df["First Created"].apply(extract_date), format="mixed", errors="coerce"
         ).dt.to_period("M").astype(str)
         df.drop(columns=["First Created"], inplace=True)
 
-    # Numeric phase cols as float32
+    # Coerce known phase columns to numeric
     for col in PHASE_COLS.values():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
@@ -148,10 +142,14 @@ st.caption(f"Live data from SmartSuite · {datetime.now().strftime('%b %d, %Y at
 st.divider()
 
 # ── Load ──────────────────────────────────────────────────────────────────────
-df = load_data(max_records=500)
+df = load_all_data()
 
 if df.empty:
-    st.warning("No data loaded.")
+    st.warning("No data loaded. Check your API credentials in Streamlit secrets.")
+    with st.expander("🔍 Debug info"):
+        st.write(f"- `API_KEY` set: `{'Yes' if API_KEY else 'No — add it to secrets!'}`")
+        st.write(f"- `ACCOUNT_ID`: `{ACCOUNT_ID}`")
+        st.write(f"- `TABLE_ID`: `{TABLE_ID}`")
     st.stop()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -160,8 +158,10 @@ st.sidebar.header("Filters")
 if "month" in df.columns:
     months = sorted(df["month"].dropna().unique())
     if len(months) >= 2:
-        sel = st.sidebar.select_slider("Date range", options=months,
-                                        value=(months[max(0, len(months)-6)], months[-1]))
+        sel = st.sidebar.select_slider(
+            "Date range", options=months,
+            value=(months[max(0, len(months)-6)], months[-1])
+        )
         df = df[(df["month"] >= sel[0]) & (df["month"] <= sel[1])]
 
 pods = sorted(df[POD_COL].dropna().unique()) if POD_COL in df.columns else []
@@ -175,6 +175,11 @@ if sel_pods and POD_COL in df.columns:
 if sel_types and TYPE_COL in df.columns:
     df = df[df[TYPE_COL].isin(sel_types)]
 
+# ── Raw data explorer (bonus: see all fields) ─────────────────────────────────
+with st.expander("🗂️ Raw data explorer (all fields)"):
+    st.dataframe(df, use_container_width=True, height=300)
+    st.caption(f"{len(df):,} rows · {len(df.columns)} columns")
+
 # ── Metrics ───────────────────────────────────────────────────────────────────
 total      = len(df)
 delayed    = int((df[STATUS_COL] == "Delayed").sum()) if STATUS_COL in df.columns else 0
@@ -185,7 +190,7 @@ delay_rate = round(delayed / denom * 100, 1) if denom > 0 else 0
 
 m1, m2, m3, m4 = st.columns(4)
 with m1:
-    st.markdown(f'<div class="metric-card"><p class="metric-label">Records (sample)</p><p class="metric-value">{total:,}</p></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="metric-card"><p class="metric-label">Total records</p><p class="metric-value">{total:,}</p></div>', unsafe_allow_html=True)
 with m2:
     st.markdown(f'<div class="metric-card"><p class="metric-label">Delivered in advance</p><p class="metric-value" style="color:#1a7f54">{in_advance:,}</p></div>', unsafe_allow_html=True)
 with m3:
@@ -205,61 +210,99 @@ if POD_COL in df.columns and STATUS_COL in df.columns:
         on_time=(STATUS_COL, lambda x: (x == "On time").sum()),
         in_advance=(STATUS_COL, lambda x: (x == "In advanced").sum()),
     ).reset_index()
-    pod_stats = pod_stats[pod_stats["total"] >= 20]
-    pod_stats["delay_rate"] = (pod_stats["delayed"] / (pod_stats["delayed"] + pod_stats["on_time"] + pod_stats["in_advance"]) * 100).round(1)
+    pod_stats = pod_stats[pod_stats["total"] >= 5]  # lowered threshold since we now have all data
+    pod_stats["delay_rate"] = (
+        pod_stats["delayed"] / (pod_stats["delayed"] + pod_stats["on_time"] + pod_stats["in_advance"]) * 100
+    ).round(1)
     pod_stats = pod_stats.sort_values("delay_rate")
 
     colors = ["#1D9E75" if r < 15 else "#BA7517" if r < 30 else "#E24B4A" for r in pod_stats["delay_rate"]]
-    fig = go.Figure(go.Bar(x=pod_stats["delay_rate"], y=pod_stats[POD_COL], orientation="h",
-                           marker_color=colors, text=[f"{r}%" for r in pod_stats["delay_rate"]], textposition="outside",
-                           hovertemplate="<b>%{y}</b><br>%{x:.1f}%<extra></extra>"))
-    fig.update_layout(height=max(300, len(pod_stats)*28), margin=dict(l=0,r=60,t=10,b=10),
-                      xaxis=dict(ticksuffix="%"), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+    fig = go.Figure(go.Bar(
+        x=pod_stats["delay_rate"], y=pod_stats[POD_COL], orientation="h",
+        marker_color=colors,
+        text=[f"{r}%" for r in pod_stats["delay_rate"]], textposition="outside",
+        hovertemplate="<b>%{y}</b><br>%{x:.1f}%<extra></extra>"
+    ))
+    fig.update_layout(
+        height=max(300, len(pod_stats)*28),
+        margin=dict(l=0, r=60, t=10, b=10),
+        xaxis=dict(ticksuffix="%"),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 # ── Bottleneck + Type ─────────────────────────────────────────────────────────
 cl, cr = st.columns(2)
 with cl:
     st.markdown('<p class="section-title">Where time is lost</p>', unsafe_allow_html=True)
-    avgs = {lbl: round(float(df[col].mean()), 2) for lbl, col in PHASE_COLS.items() if col in df.columns and not pd.isna(df[col].mean())}
+    avgs = {
+        lbl: round(float(df[col].mean()), 2)
+        for lbl, col in PHASE_COLS.items()
+        if col in df.columns and not pd.isna(df[col].mean())
+    }
     if avgs:
-        pf = pd.DataFrame(list(avgs.items()), columns=["Phase","Avg days"]).sort_values("Avg days", ascending=True)
-        cb = ["#E24B4A" if v>5 else "#BA7517" if v>2 else "#1D9E75" for v in pf["Avg days"]]
-        fig2 = go.Figure(go.Bar(x=pf["Avg days"], y=pf["Phase"], orientation="h", marker_color=cb,
-                                text=[f"{v}d" for v in pf["Avg days"]], textposition="outside"))
-        fig2.update_layout(height=320, margin=dict(l=0,r=50,t=10,b=10), xaxis=dict(title="Avg days"),
-                           plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        pf = pd.DataFrame(list(avgs.items()), columns=["Phase", "Avg days"]).sort_values("Avg days", ascending=True)
+        cb = ["#E24B4A" if v > 5 else "#BA7517" if v > 2 else "#1D9E75" for v in pf["Avg days"]]
+        fig2 = go.Figure(go.Bar(
+            x=pf["Avg days"], y=pf["Phase"], orientation="h",
+            marker_color=cb, text=[f"{v}d" for v in pf["Avg days"]], textposition="outside"
+        ))
+        fig2.update_layout(
+            height=320, margin=dict(l=0, r=50, t=10, b=10),
+            xaxis=dict(title="Avg days"),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+        )
         st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info("No phase duration columns found in data.")
 
 with cr:
     st.markdown('<p class="section-title">Delay rate by type</p>', unsafe_allow_html=True)
     if TYPE_COL in df.columns and STATUS_COL in df.columns:
-        core = ["Campaign","Flow","SMS","Side Quest","Text Based - Campaign"]
+        core = ["Campaign", "Flow", "SMS", "Side Quest", "Text Based - Campaign"]
         tdf = df[df[TYPE_COL].isin(core)]
+        if tdf.empty:
+            # Fallback: show all types
+            tdf = df.copy()
         ts = tdf.groupby(TYPE_COL, observed=True).apply(
-            lambda x: round((x[STATUS_COL]=="Delayed").sum()/max(len(x),1)*100, 1)
+            lambda x: round((x[STATUS_COL] == "Delayed").sum() / max(len(x), 1) * 100, 1)
         ).reset_index()
-        ts.columns = ["Type","Delay rate %"]
+        ts.columns = ["Type", "Delay rate %"]
         ts = ts.sort_values("Delay rate %")
-        ct = ["#E24B4A" if v>30 else "#BA7517" if v>12 else "#1D9E75" for v in ts["Delay rate %"]]
-        fig3 = go.Figure(go.Bar(x=ts["Type"], y=ts["Delay rate %"], marker_color=ct,
-                                text=[f"{v}%" for v in ts["Delay rate %"]], textposition="outside"))
-        fig3.update_layout(height=320, margin=dict(l=0,r=20,t=10,b=10),
-                           yaxis=dict(ticksuffix="%"), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        ct = ["#E24B4A" if v > 30 else "#BA7517" if v > 12 else "#1D9E75" for v in ts["Delay rate %"]]
+        fig3 = go.Figure(go.Bar(
+            x=ts["Type"], y=ts["Delay rate %"],
+            marker_color=ct, text=[f"{v}%" for v in ts["Delay rate %"]], textposition="outside"
+        ))
+        fig3.update_layout(
+            height=320, margin=dict(l=0, r=20, t=10, b=10),
+            yaxis=dict(ticksuffix="%"),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+        )
         st.plotly_chart(fig3, use_container_width=True)
 
 # ── Monthly volume ────────────────────────────────────────────────────────────
 monthly = None
 if "month" in df.columns and STATUS_COL in df.columns:
     st.markdown('<p class="section-title">Monthly volume & delays</p>', unsafe_allow_html=True)
-    monthly = df.groupby("month").agg(total=("month","count"), delayed=(STATUS_COL, lambda x: (x=="Delayed").sum())).reset_index().sort_values("month")
+    monthly = df.groupby("month").agg(
+        total=("month", "count"),
+        delayed=(STATUS_COL, lambda x: (x == "Delayed").sum())
+    ).reset_index().sort_values("month")
     fig4 = go.Figure()
-    fig4.add_trace(go.Scatter(x=monthly["month"], y=monthly["total"], name="Total", fill="tozeroy",
-                              line=dict(color="#378ADD",width=2), fillcolor="rgba(55,138,221,0.1)"))
-    fig4.add_trace(go.Scatter(x=monthly["month"], y=monthly["delayed"], name="Delayed",
-                              line=dict(color="#E24B4A",width=2,dash="dot")))
-    fig4.update_layout(height=240, margin=dict(l=0,r=20,t=10,b=10), legend=dict(orientation="h",y=1.1),
-                       plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+    fig4.add_trace(go.Scatter(
+        x=monthly["month"], y=monthly["total"], name="Total",
+        fill="tozeroy", line=dict(color="#378ADD", width=2), fillcolor="rgba(55,138,221,0.1)"
+    ))
+    fig4.add_trace(go.Scatter(
+        x=monthly["month"], y=monthly["delayed"], name="Delayed",
+        line=dict(color="#E24B4A", width=2, dash="dot")
+    ))
+    fig4.update_layout(
+        height=240, margin=dict(l=0, r=20, t=10, b=10),
+        legend=dict(orientation="h", y=1.1),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+    )
     st.plotly_chart(fig4, use_container_width=True)
 
 # ── AI Q&A ────────────────────────────────────────────────────────────────────
@@ -268,15 +311,17 @@ st.markdown("### 💬 Ask Claude about your data")
 question = st.text_input("", placeholder="e.g. Which pod needs help most? Why are flows delayed?")
 
 if question:
-    pod_tbl = pod_stats[["Pod","total","delay_rate"]].to_string(index=False) if pod_stats is not None else "N/A"
-    mon_tbl = monthly[["month","total","delayed"]].tail(6).to_string(index=False) if monthly is not None else "N/A"
-    prompt = f"""Analyzing operational data from a marketing agency SmartSuite system.
+    pod_tbl  = pod_stats[["Pod", "total", "delay_rate"]].to_string(index=False) if pod_stats is not None else "N/A"
+    mon_tbl  = monthly[["month", "total", "delayed"]].tail(6).to_string(index=False) if monthly is not None else "N/A"
+    prompt = f"""You are analyzing operational data from a marketing agency's SmartSuite system.
 
-Stats (sample of {total:,} records, {delay_rate}% delay rate):
+Total records loaded: {total:,}
+Overall delay rate: {delay_rate}%
+
 Pod performance:
 {pod_tbl}
 
-Monthly volume:
+Monthly volume (last 6 months):
 {mon_tbl}
 
 Question: {question}
@@ -286,8 +331,11 @@ Answer concisely and practically."""
         try:
             import anthropic
             client = anthropic.Anthropic(api_key=API_KEY)
-            msg = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=600,
-                                         messages=[{"role":"user","content":prompt}])
+            msg = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}]
+            )
             st.info(msg.content[0].text)
         except Exception as e:
             st.error(f"Claude API error: {e}")
