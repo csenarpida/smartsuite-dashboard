@@ -55,43 +55,62 @@ def fetch_page(offset, limit, headers):
 
 @st.cache_data(ttl=3600, max_entries=1)
 def load_all_data():
-    """Fetch ALL records with ALL fields from SmartSuite."""
+    """Fetch ALL records from the specific table, stopping when items run out."""
     headers = {
         "Authorization": f"Token {API_KEY}",
         "Account-Id": ACCOUNT_ID,
         "Content-Type": "application/json",
     }
 
-    # First call: get total count
-    items, total = fetch_page(0, 1, headers)
-    if items is None:
+    # First call: get total count for THIS table only
+    first_batch, total = fetch_page(0, 250, headers)
+    if first_batch is None:
         st.error("❌ Could not connect to SmartSuite. Check your API key in Streamlit secrets.")
         return pd.DataFrame()
 
-    if total == 0:
+    if total == 0 and not first_batch:
         st.warning("⚠️ API connected but returned 0 records. Check TABLE_ID and ACCOUNT_ID.")
         return pd.DataFrame()
 
-    st.info(f"📦 Found **{total:,}** records. Fetching all...")
+    # Use the total from the first response — this is table-scoped
+    st.info(f"📦 Table reports **{total:,}** records. Fetching all...")
 
     rows = []
     limit = 250
-    offsets = list(range(0, total, limit))
-    progress = st.progress(0, text="Loading records...")
+
+    # Process first batch already fetched
+    for record in first_batch:
+        fields = record.get("fields", record)
+        rows.append(fields)
+
+    # Only paginate up to what the table actually reported
+    offsets = list(range(limit, total, limit))
+    progress = st.progress(0, text=f"Loaded {len(rows):,} / {total:,} records...")
 
     for i, offset in enumerate(offsets):
         batch, _ = fetch_page(offset, limit, headers)
-        if batch is None:
+
+        # Stop if API returns nothing — real end of data
+        if not batch:
             break
+
         for record in batch:
-            # Grab ALL fields — no filtering
             fields = record.get("fields", record)
             rows.append(fields)
-        progress.progress((i + 1) / len(offsets), text=f"Batch {i+1}/{len(offsets)} — {len(rows):,} records loaded")
+
+        progress.progress(
+            min(len(rows) / total, 1.0),
+            text=f"Loaded {len(rows):,} / {total:,} records..."
+        )
+
+        # Stop if we've hit the reported total
+        if len(rows) >= total:
+            break
+
         gc.collect()
 
     progress.empty()
-    st.success(f"✅ Loaded {len(rows):,} of {total:,} records.")
+    st.success(f"✅ Loaded **{len(rows):,}** records from table.")
 
     if not rows:
         return pd.DataFrame()
@@ -175,7 +194,7 @@ if sel_pods and POD_COL in df.columns:
 if sel_types and TYPE_COL in df.columns:
     df = df[df[TYPE_COL].isin(sel_types)]
 
-# ── Raw data explorer (bonus: see all fields) ─────────────────────────────────
+# ── Raw data explorer ─────────────────────────────────────────────────────────
 with st.expander("🗂️ Raw data explorer (all fields)"):
     st.dataframe(df, use_container_width=True, height=300)
     st.caption(f"{len(df):,} rows · {len(df.columns)} columns")
@@ -210,7 +229,7 @@ if POD_COL in df.columns and STATUS_COL in df.columns:
         on_time=(STATUS_COL, lambda x: (x == "On time").sum()),
         in_advance=(STATUS_COL, lambda x: (x == "In advanced").sum()),
     ).reset_index()
-    pod_stats = pod_stats[pod_stats["total"] >= 5]  # lowered threshold since we now have all data
+    pod_stats = pod_stats[pod_stats["total"] >= 5]
     pod_stats["delay_rate"] = (
         pod_stats["delayed"] / (pod_stats["delayed"] + pod_stats["on_time"] + pod_stats["in_advance"]) * 100
     ).round(1)
@@ -262,7 +281,6 @@ with cr:
         core = ["Campaign", "Flow", "SMS", "Side Quest", "Text Based - Campaign"]
         tdf = df[df[TYPE_COL].isin(core)]
         if tdf.empty:
-            # Fallback: show all types
             tdf = df.copy()
         ts = tdf.groupby(TYPE_COL, observed=True).apply(
             lambda x: round((x[STATUS_COL] == "Delayed").sum() / max(len(x), 1) * 100, 1)
@@ -311,8 +329,8 @@ st.markdown("### 💬 Ask Claude about your data")
 question = st.text_input("", placeholder="e.g. Which pod needs help most? Why are flows delayed?")
 
 if question:
-    pod_tbl  = pod_stats[["Pod", "total", "delay_rate"]].to_string(index=False) if pod_stats is not None else "N/A"
-    mon_tbl  = monthly[["month", "total", "delayed"]].tail(6).to_string(index=False) if monthly is not None else "N/A"
+    pod_tbl = pod_stats[["Pod", "total", "delay_rate"]].to_string(index=False) if pod_stats is not None else "N/A"
+    mon_tbl = monthly[["month", "total", "delayed"]].tail(6).to_string(index=False) if monthly is not None else "N/A"
     prompt = f"""You are analyzing operational data from a marketing agency's SmartSuite system.
 
 Total records loaded: {total:,}
